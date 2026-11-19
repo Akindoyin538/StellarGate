@@ -489,7 +489,7 @@ Recovers deliveries left `pending`/`failed` by a process that exited mid-send or
 |---|---|---|
 | `WEBHOOK_REDRIVE_INTERVAL_SECS` | Scan frequency | `30` |
 | `WEBHOOK_REDRIVE_CONCURRENCY` | Max redrive requests in flight | `4` |
-| `WEBHOOK_REDRIVE_MAX_ATTEMPTS` | Total attempts (inline + redrive) before a delivery is left permanently `failed` | `8` |
+| `WEBHOOK_REDRIVE_MAX_ATTEMPTS` | **Total** attempts (inline + redrive) before a delivery is left permanently `failed`. The count includes the `WEBHOOK_RETRY_ATTEMPTS` inline attempts, so it must be **greater than** `WEBHOOK_RETRY_ATTEMPTS` (validated at boot); at or below it, no inline-failed delivery is ever redriven. | `8` |
 | `WEBHOOK_REDRIVE_GRACE_SECS` | Idle time required before the worker touches a row, so it never races an in-flight inline delivery. Also the floor under the backoff. Must be `1..=86,400`. | `60` |
 | `WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS` | Exponential backoff base: `initial × 2^(attempts−1)`. A row never attempted is exempt and gated only by the grace window. Must be `0..=86,400`; `0` disables growth. | `30` |
 | `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS` | Backoff ceiling. Must be `1..=86,400` and `≥` the initial value. | `900` |

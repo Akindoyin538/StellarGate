@@ -417,6 +417,8 @@ impl Config {
     ///   target endpoint with no back-off
     /// - `REQUEST_TIMEOUT_SECS == 0` → every request is aborted immediately
     /// - `WEBHOOK_TIMEOUT_SECS == 0` → every webhook attempt fails immediately
+    /// - `WEBHOOK_REDRIVE_MAX_ATTEMPTS <= WEBHOOK_RETRY_ATTEMPTS` → the redrive
+    ///   worker never selects an inline-failed delivery
     /// - `DB_BUSY_TIMEOUT_MS == 0` → any write that meets another writer fails
     ///   immediately with `SQLITE_BUSY`
     /// - `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS < WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS`
@@ -469,6 +471,21 @@ impl Config {
                  inline retry backoff would never actually grow.",
                 self.webhook_retry_max_delay_ms,
                 self.webhook_retry_delay_ms
+            ));
+        }
+
+        /* WEBHOOK_REDRIVE_MAX_ATTEMPTS is a total that includes the inline
+        attempts already recorded by `dispatch()`. The redrive worker only
+        selects rows with `attempts < WEBHOOK_REDRIVE_MAX_ATTEMPTS`, so a cap at
+        or below the inline budget means no inline-failed delivery is ever
+        redriven, and the worker silently does nothing (issue #974). */
+        if self.webhook_redrive_max_attempts <= self.webhook_retry_attempts {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_MAX_ATTEMPTS ({}) must be > WEBHOOK_RETRY_ATTEMPTS ({}). \
+                 WEBHOOK_REDRIVE_MAX_ATTEMPTS is a total that includes the inline attempts, \
+                 so with this setting no delivery that failed inline would ever be redriven.",
+                self.webhook_redrive_max_attempts,
+                self.webhook_retry_attempts
             ));
         }
 
@@ -1274,6 +1291,34 @@ mod tests {
         cfg.stream_idle_timeout_secs = 0;
         let err = cfg.validate_timing().unwrap_err().to_string();
         assert!(err.contains("STREAM_IDLE_TIMEOUT_SECS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_rejects_redrive_cap_equal_to_inline_attempts() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 3;
+        cfg.webhook_redrive_max_attempts = 3;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(
+            err.contains("WEBHOOK_REDRIVE_MAX_ATTEMPTS") && err.contains("WEBHOOK_RETRY_ATTEMPTS"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_rejects_redrive_cap_below_inline_attempts() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 5;
+        cfg.webhook_redrive_max_attempts = 3;
+        assert!(cfg.validate_timing().is_err());
+    }
+
+    #[test]
+    fn timing_allows_redrive_cap_one_above_inline_attempts() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 3;
+        cfg.webhook_redrive_max_attempts = 4;
+        assert!(cfg.validate_timing().is_ok());
     }
 
     #[test]
