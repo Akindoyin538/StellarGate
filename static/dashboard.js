@@ -680,6 +680,7 @@ import { sortPayments } from "./sort.js";
     var intervalMs = (prefs.get().refreshIntervalSec || 30) * 1000;
     autoRefreshTimer = window.setInterval(function () {
       var stateSnap = store.get();
+      if (document.hidden) return; // #803: no polling from background tabs
       if (stateSnap.key && stateSnap.autoRefresh && (!stateSnap.status || stateSnap.status === "pending")) {
         reload();
       }
@@ -2090,8 +2091,17 @@ import { sortPayments } from "./sort.js";
     });
 
     window.setInterval(function () {
+      if (document.hidden) return; // #803: pause health polling while hidden
       if (store.get().key) { pollHealth(); checkDeployedVersion(); }
     }, 30000);
+
+    // #803: refresh once as soon as the tab becomes visible again.
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden || !store.get().key) return;
+      pollHealth();
+      var snap = store.get();
+      if (snap.autoRefresh && (!snap.status || snap.status === "pending")) reload();
+    });
 
     restartAutoRefreshTimer();
 
