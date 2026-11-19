@@ -122,9 +122,11 @@
           type="password"
           placeholder="merchant API key"
           data-i18n-placeholder="gate.apiKeyPlaceholder"
+          autocomplete="off"
           spellcheck="false"
           required
         />
+        <button id="api-key-toggle" type="button" class="ghost" aria-pressed="false" aria-controls="api-key">Show</button>
         <label class="checkbox">
           <input id="remember" type="checkbox" />
           <span data-i18n="gate.remember">Keep me signed in on this device</span>
@@ -382,6 +384,11 @@
         <p id="rate-limit" class="error" role="status" hidden></p>
 
         <section id="summary" class="summary" aria-label="Payment summary"></section>
+        <section id="asset-totals" class="summary" aria-label="Completed total per asset"></section>
+        <div id="idle-warning" class="card" role="alertdialog" aria-live="assertive" hidden>
+          <span>You will be signed out in 60 seconds due to inactivity.</span>
+          <button id="idle-stay" type="button" class="primary">Stay signed in</button>
+        </div>
 
         <!-- Admin: API keys for a merchant. Operators can list existing keys
              (id, prefix, created, revoked) and issue or revoke keys. Full key
