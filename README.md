@@ -445,7 +445,7 @@ skipped are logged at `info` on every first run.
 | Variable | Description | Default |
 |---|---|---|
 | `WEBHOOK_SECRET` | HMAC-SHA256 signing secret. Must be **≥ 32 characters**; known placeholder values are rejected at boot. | — |
-| `ALLOWED_WEBHOOK_SCHEMES` | Comma-separated URL schemes accepted for `webhook_url`. HTTPS is enforced on `public` regardless of this value. | `https` |
+| `ALLOWED_WEBHOOK_SCHEMES` | Comma-separated URL schemes accepted for `webhook_url`; only `http` and `https` are allowed, case-insensitively (`HTTPS` is fine). Any other scheme, or an empty list, aborts boot (issue #971). HTTPS is enforced on `public` regardless of this value. | `https` |
 | `WEBHOOK_RETRY_ATTEMPTS` | Inline delivery attempts | `3` |
 | `WEBHOOK_RETRY_DELAY_MS` | **Base** delay between inline retries — the first step of an exponential, jittered schedule, not a fixed interval | `5000` |
 | `WEBHOOK_RETRY_MAX_DELAY_MS` | Ceiling on one inline retry delay. Must be `≥` `WEBHOOK_RETRY_DELAY_MS`. | `60000` |

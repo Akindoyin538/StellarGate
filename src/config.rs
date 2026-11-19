@@ -245,15 +245,9 @@ impl Config {
         let gateway_public =
             std::env::var("STELLAR_GATEWAY_PUBLIC").unwrap_or_else(|_| "UNCONFIGURED".to_string());
         let webhook_secret = Self::validate_webhook_secret(std::env::var("WEBHOOK_SECRET"))?;
-        let allowed_webhook_schemes: Vec<String> = {
-            let raw_schemes =
-                std::env::var("ALLOWED_WEBHOOK_SCHEMES").unwrap_or_else(|_| "https".to_string());
-            raw_schemes
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        };
+        let allowed_webhook_schemes = parse_webhook_schemes(
+            &std::env::var("ALLOWED_WEBHOOK_SCHEMES").unwrap_or_else(|_| "https".to_string()),
+        )?;
 
         /* Independent of network: HTTPS is enforced unconditionally on
         `public` regardless of this list, but on any other network an
@@ -897,6 +891,36 @@ fn validate_network_horizon(network: &str, horizon_url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Parse `ALLOWED_WEBHOOK_SCHEMES` (issue #971).
+///
+/// Entries are trimmed and lowercased. `reqwest::Url` always lowercases the
+/// scheme it parses, so a stored `HTTPS` would reject every `https://` webhook
+/// URL. Only `http` and `https` are accepted, because the SSRF guard permits
+/// no other scheme and any other entry could never be used. An empty list is
+/// refused, because it would reject every webhook.
+fn parse_webhook_schemes(raw: &str) -> Result<Vec<String>> {
+    let mut schemes: Vec<String> = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let scheme = entry.to_ascii_lowercase();
+        if !matches!(scheme.as_str(), "http" | "https") {
+            return Err(anyhow::anyhow!(
+                "ALLOWED_WEBHOOK_SCHEMES contains an unsupported scheme {entry:?}. \
+                 Only \"http\" and \"https\" are supported. Fix or remove the bad entry."
+            ));
+        }
+        if !schemes.contains(&scheme) {
+            schemes.push(scheme);
+        }
+    }
+    if schemes.is_empty() {
+        return Err(anyhow::anyhow!(
+            "ALLOWED_WEBHOOK_SCHEMES is empty, so every webhook_url would be rejected. \
+             Set it to \"https\", or unset it to use the default."
+        ));
+    }
+    Ok(schemes)
+}
+
 /// Parse `TRUSTED_PROXY_CIDRS`: a comma-separated list of CIDR blocks (IPv4 or
 /// IPv6), e.g. `TRUSTED_PROXY_CIDRS=10.0.0.0/8,192.168.1.0/24`. Empty/unset
 /// means no trusted proxies, in which case forwarding headers are ignored
@@ -1322,6 +1346,108 @@ mod tests {
             || {
                 let err = Config::from_env().unwrap_err().to_string();
                 assert!(err.contains("CORS_ALLOWED_ORIGINS"), "got: {err}");
+            },
+        );
+    }
+
+    // ── issue #971: ALLOWED_WEBHOOK_SCHEMES normalisation and validation ─────
+
+    #[test]
+    fn webhook_schemes_are_lowercased() {
+        assert_eq!(parse_webhook_schemes("HTTPS").unwrap(), vec!["https"]);
+        assert_eq!(
+            parse_webhook_schemes("https,HTTP").unwrap(),
+            vec!["https", "http"]
+        );
+    }
+
+    #[test]
+    fn webhook_schemes_trim_and_deduplicate() {
+        assert_eq!(
+            parse_webhook_schemes(" https , https ,, ").unwrap(),
+            vec!["https"]
+        );
+    }
+
+    #[test]
+    fn webhook_schemes_reject_unsupported_scheme() {
+        for raw in ["ftp", "ws", "https,ftp", "file"] {
+            let err = parse_webhook_schemes(raw).unwrap_err().to_string();
+            assert!(
+                err.contains("unsupported scheme") && err.contains("ALLOWED_WEBHOOK_SCHEMES"),
+                "{raw:?} should be rejected; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_schemes_reject_empty_list() {
+        for raw in [",", "", "  ", " , , "] {
+            let err = parse_webhook_schemes(raw).unwrap_err().to_string();
+            assert!(
+                err.contains("is empty"),
+                "{raw:?} should be rejected; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_accepts_upper_case_https_webhook_scheme() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("ALLOWED_WEBHOOK_SCHEMES", Some("HTTPS")),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.allowed_webhook_schemes, vec!["https"]);
+            },
+        );
+    }
+
+    #[test]
+    fn startup_aborts_on_unsupported_webhook_scheme() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("ALLOWED_WEBHOOK_SCHEMES", Some("ftp")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("ftp"), "got: {err}");
+                assert!(err.contains("ALLOWED_WEBHOOK_SCHEMES"), "got: {err}");
+            },
+        );
+    }
+
+    #[test]
+    fn startup_aborts_on_empty_webhook_scheme_list() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("ALLOWED_WEBHOOK_SCHEMES", Some(",")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("ALLOWED_WEBHOOK_SCHEMES"), "got: {err}");
+            },
+        );
+    }
+
+    #[test]
+    fn webhook_schemes_default_to_https_when_unset() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("ALLOWED_WEBHOOK_SCHEMES", None),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.allowed_webhook_schemes, vec!["https"]);
             },
         );
     }
