@@ -503,9 +503,99 @@ import { sortPayments } from "./sort.js";
     setError($("gate-error"), message || null);
   }
 
-  function signOut(message) {
+  // ── Cross-tab sign-out (#795) ─────────────────────────────────────────────
+  // Only a signal is broadcast — never the key itself.
+  var SIGNOUT_SIGNAL = "stellargate.signout";
+  var signoutChannel = null;
+  try {
+    if (typeof BroadcastChannel === "function") {
+      signoutChannel = new BroadcastChannel(SIGNOUT_SIGNAL);
+      signoutChannel.onmessage = function () { localSignOut(null); };
+    }
+  } catch (e) { signoutChannel = null; }
+
+  window.addEventListener("storage", function (ev) {
+    if (ev.key === SIGNOUT_SIGNAL && ev.newValue) localSignOut(null);
+  });
+
+  function broadcastSignOut() {
+    if (signoutChannel) {
+      try { signoutChannel.postMessage("signout"); return; } catch (e) { /* fall through */ }
+    }
+    try {
+      window.localStorage.setItem(SIGNOUT_SIGNAL, String(Date.now()));
+      window.localStorage.removeItem(SIGNOUT_SIGNAL);
+    } catch (e) { /* non-fatal */ }
+  }
+
+  function localSignOut(message) {
+    stopIdleWatch();
     session.clear();
+    store.update({ loadedPayments: [] });
+    clear($("rows"));
+    clear($("summary"));
     showGate(message);
+  }
+
+  function signOut(message) {
+    localSignOut(message);
+    broadcastSignOut();
+  }
+
+  // ── Idle sign-out (#794) ──────────────────────────────────────────────────
+  var IDLE_MS = 30 * 60 * 1000;
+  var IDLE_WARN_MS = 60 * 1000;
+  var idleTimer = null;
+  var idleWarnTimer = null;
+  var idleListening = false;
+
+  function idleMs() {
+    var n = Number(prefs.get().idleMinutes);
+    return isFinite(n) && n > 0 ? n * 60 * 1000 : IDLE_MS;
+  }
+
+  function hideIdleWarning() {
+    var w = $("idle-warning");
+    if (w) show(w, false);
+  }
+
+  function resetIdleTimer() {
+    window.clearTimeout(idleTimer);
+    window.clearTimeout(idleWarnTimer);
+    hideIdleWarning();
+    if (!store.get().key) return;
+    var total = idleMs();
+    idleWarnTimer = window.setTimeout(function () {
+      var w = $("idle-warning");
+      if (w) show(w, true);
+    }, Math.max(0, total - IDLE_WARN_MS));
+    idleTimer = window.setTimeout(function () { signOut("Signed out after a period of inactivity."); }, total);
+  }
+
+  function onActivity(ev) {
+    if (ev && ev.type === "visibilitychange" && document.hidden) return;
+    // Once the warning is up, only the explicit button extends the session.
+    var w = $("idle-warning");
+    if (w && !w.hidden) return;
+    resetIdleTimer();
+  }
+
+  function startIdleWatch() {
+    if (!idleListening) {
+      idleListening = true;
+      ["keydown", "pointerdown", "pointermove", "visibilitychange"].forEach(function (name) {
+        (name === "visibilitychange" ? document : window).addEventListener(name, onActivity, { passive: true });
+      });
+      var stay = $("idle-stay");
+      if (stay) stay.addEventListener("click", resetIdleTimer);
+    }
+    resetIdleTimer();
+  }
+
+  function stopIdleWatch() {
+    window.clearTimeout(idleTimer);
+    window.clearTimeout(idleWarnTimer);
+    hideIdleWarning();
   }
 
   function signIn(key, persist) {
@@ -517,6 +607,7 @@ import { sortPayments } from "./sort.js";
       show($("app"), true);
       setError($("gate-error"), null);
       updateSessionExpiry();
+      startIdleWatch();
       loadVersion();
       loadNetworkBadge();
       pollHealth();
@@ -626,6 +717,7 @@ import { sortPayments } from "./sort.js";
         var rows = store.get().loadedPayments.concat(payments);
         store.update({ loadedPayments: rows });
         renderRows();
+        renderAssetTotals();
 
         var more = payments.length === store.get().pageSize && !!body.next_cursor;
         store.update({ cursor: more ? body.next_cursor : null });
@@ -659,6 +751,28 @@ import { sortPayments } from "./sort.js";
           loadPayments();
         }
       });
+  }
+
+  // Completed totals per asset for the active date range (#793). The summary
+  // endpoint only returns status counts, so this sums the loaded payments; the
+  // list request already carries the date range filter.
+  function renderAssetTotals() {
+    var box = $("asset-totals");
+    if (!box) return;
+    clear(box);
+    var totals = {};
+    store.get().loadedPayments.forEach(function (p) {
+      if (p.status !== "completed") return;
+      var n = Number(p.paid_amount || p.amount);
+      if (!isFinite(n)) return;
+      totals[p.asset] = (totals[p.asset] || 0) + n;
+    });
+    Object.keys(totals).sort().forEach(function (asset) {
+      var card = el("div", "summary-card");
+      card.appendChild(el("span", "muted small", "Received " + asset));
+      card.appendChild(el("strong", null, formatAmount(totals[asset], asset)));
+      box.appendChild(card);
+    });
   }
 
   function loadSummary() {
@@ -1813,6 +1927,9 @@ import { sortPayments } from "./sort.js";
       ev.preventDefault();
       var key = $("api-key").value.trim();
       if (!key) return;
+      $("api-key").type = "password";
+      $("api-key-toggle").setAttribute("aria-pressed", "false");
+      $("api-key-toggle").textContent = "Show";
       setError($("gate-error"), null);
       signIn(key, $("remember").checked).catch(function (err) {
         if (err.message !== "unauthorized") setError($("gate-error"), err.message);
@@ -1820,6 +1937,17 @@ import { sortPayments } from "./sort.js";
     });
 
     $("sign-out").addEventListener("click", function () { signOut(null); });
+
+    var keyToggle = $("api-key-toggle");
+    if (keyToggle) {
+      keyToggle.addEventListener("click", function () {
+        var input = $("api-key");
+        var reveal = input.type === "password";
+        input.type = reveal ? "text" : "password";
+        keyToggle.setAttribute("aria-pressed", reveal ? "true" : "false");
+        keyToggle.textContent = reveal ? "Hide" : "Show";
+      });
+    }
 
     var versionReload = $("version-reload");
     if (versionReload) {
