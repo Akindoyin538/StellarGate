@@ -416,6 +416,8 @@ impl Config {
     /// - `WEBHOOK_RETRY_DELAY_MS == 0` with retries > 1 → retries hammer the
     ///   target endpoint with no back-off
     /// - `REQUEST_TIMEOUT_SECS == 0` → every request is aborted immediately
+    /// - `DB_BUSY_TIMEOUT_MS == 0` → any write that meets another writer fails
+    ///   immediately with `SQLITE_BUSY`
     /// - `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS < WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS`
     ///   → the cap would silently override the starting delay, so backoff
     ///   never actually grows
@@ -504,6 +506,15 @@ impl Config {
                 "STREAM_IDLE_TIMEOUT_SECS must be > 0 (got 0). \
                  A zero timeout would make the stream listener reconnect \
                  continuously instead of tolerating any gap between events."
+            ));
+        }
+
+        if self.db_busy_timeout_ms == 0 {
+            return Err(anyhow::anyhow!(
+                "DB_BUSY_TIMEOUT_MS must be > 0 (got 0). \
+                 A zero busy timeout makes any write that meets another writer fail \
+                 immediately with SQLITE_BUSY, which surfaces as 500s and failed settlements \
+                 under ordinary concurrency."
             ));
         }
 
@@ -1254,6 +1265,21 @@ mod tests {
         cfg.stream_idle_timeout_secs = 0;
         let err = cfg.validate_timing().unwrap_err().to_string();
         assert!(err.contains("STREAM_IDLE_TIMEOUT_SECS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_rejects_zero_db_busy_timeout() {
+        let mut cfg = timing_config();
+        cfg.db_busy_timeout_ms = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("DB_BUSY_TIMEOUT_MS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_allows_nonzero_db_busy_timeout() {
+        let mut cfg = timing_config();
+        cfg.db_busy_timeout_ms = 1;
+        assert!(cfg.validate_timing().is_ok());
     }
 
     #[test]
