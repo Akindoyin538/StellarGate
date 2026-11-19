@@ -532,7 +532,7 @@ until it finished; a backlog drains over several cycles instead.
 |---|---|---|
 | `ADMIN_PROVISIONING_SECRET` | Required via `X-Admin-Secret` to call `POST /merchants`. Unset disables provisioning entirely (always `401`). | _(unset — disabled)_ |
 | `METRICS_TOKEN` | Required via `Authorization: Bearer <token>` to call `GET /metrics`. Unset disables scraping entirely (always `401`) — the endpoint exposes auth outcome counters and webhook delivery volume, so it must not be reachable anonymously by default (issue #250). | _(unset — disabled)_ |
-| `CORS_ALLOWED_ORIGINS` | Comma-separated origins. **Required** on `public`; omitting on testnet falls back to permissive with a warning. | _(unset)_ |
+| `CORS_ALLOWED_ORIGINS` | Comma-separated origins, each in the browser `Origin` form `scheme://host[:port]` (e.g. `https://app.example.com`). A single trailing `/` is accepted. Paths, query strings, fragments, credentials, scheme-less hosts and `*` abort boot, naming the bad entry (issue #970). **Required** on `public`; omitting on testnet falls back to permissive with a warning. | _(unset)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Base per-IP limit. Write routes get this rate; read-only routes get 5×. Must be `> 0` — boot fails otherwise; there is no "disabled" value. | `10` |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated CIDR blocks whose `X-Forwarded-For`/`X-Real-IP` headers are honored for rate-limit bucketing and auth-log attribution. Every other peer is attributed by its own address and its headers are ignored — the safe default. | _(unset — headers ignored)_ |
 | `DB_POOL_MAX_CONNECTIONS` | SQLite pool size. WAL allows one writer plus many readers. | `10` |

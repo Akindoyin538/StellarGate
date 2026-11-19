@@ -267,28 +267,16 @@ impl Config {
             );
         }
 
-        let cors_allowed_origins: Vec<String> = {
-            let raw_origins: Vec<String> = std::env::var("CORS_ALLOWED_ORIGINS")
-                .unwrap_or_default()
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect();
-
-            // Validate every configured origin now so a typo aborts boot with
-            // a clear message instead of silently removing the origin from the
-            // allowlist (or producing an empty allowlist with no error).
-            for origin in &raw_origins {
-                origin.parse::<axum::http::HeaderValue>().map_err(|e| {
-                    anyhow::anyhow!(
-                        "CORS_ALLOWED_ORIGINS contains an invalid origin {origin:?}: {e}. \
-                         Fix or remove the bad entry."
-                    )
-                })?;
-            }
-            raw_origins
-        };
+        // Every entry is validated and normalised now, so a bad entry aborts
+        // boot with a clear message instead of silently never matching a
+        // browser's `Origin` header (issue #970).
+        let cors_allowed_origins: Vec<String> = std::env::var("CORS_ALLOWED_ORIGINS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(normalise_cors_origin)
+            .collect::<Result<Vec<String>>>()?;
 
         if network == "public" && cors_allowed_origins.is_empty() {
             return Err(anyhow::anyhow!(
@@ -805,6 +793,60 @@ impl std::fmt::Debug for Config {
     }
 }
 
+/// Validate one `CORS_ALLOWED_ORIGINS` entry and return its canonical form
+/// (issue #970).
+///
+/// Browsers send `Origin` as `scheme://host[:port]`, with no path, query,
+/// fragment, credentials or trailing slash. An entry in any other shape passed
+/// the old header-value check but never matched a request, so the dashboard or
+/// merchant frontend failed with an opaque CORS error. Those entries are
+/// rejected here instead.
+///
+/// One trailing `/` is tolerated and stripped, since it is the most common
+/// copy-paste form. The result is the serialised origin, so
+/// `HTTPS://App.Example.com:443/` becomes `https://app.example.com`, the same
+/// string a browser sends.
+fn normalise_cors_origin(entry: &str) -> Result<String> {
+    let invalid = |reason: &str| {
+        anyhow::anyhow!(
+            "CORS_ALLOWED_ORIGINS contains an invalid origin {entry:?}: {reason}. \
+             Use the form https://app.example.com (scheme, host and optional port, \
+             no path). Fix or remove the bad entry."
+        )
+    };
+
+    if entry == "*" {
+        return Err(invalid(
+            "wildcards are not supported; list each origin explicitly",
+        ));
+    }
+
+    let candidate = entry.strip_suffix('/').unwrap_or(entry);
+    if candidate.ends_with('/') {
+        return Err(invalid("more than one trailing slash"));
+    }
+
+    let url = reqwest::Url::parse(candidate)
+        .map_err(|_| invalid("expected a full URL with a scheme, e.g. https://app.example.com"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(invalid("the scheme must be http or https"));
+    }
+    if url.host_str().is_none() {
+        return Err(invalid("the host is missing"));
+    }
+    if url.path() != "/" {
+        return Err(invalid("a path is not allowed"));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(invalid("query strings and fragments are not allowed"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid("credentials are not allowed"));
+    }
+
+    Ok(url.origin().ascii_serialization())
+}
+
 /// The Horizon endpoint used when `STELLAR_HORIZON_URL` is unset, chosen to
 /// match `STELLAR_NETWORK`. Without this, a `public` gateway with no explicit
 /// Horizon URL silently watched the testnet ledger for mainnet accounts
@@ -1142,6 +1184,144 @@ mod tests {
             || {
                 Config::from_env().unwrap();
                 assert!(!logs_contain("mainnet Horizon"));
+            },
+        );
+    }
+
+    // ── issue #970: CORS_ALLOWED_ORIGINS must be bare origins ────────────────
+
+    #[test]
+    fn cors_origin_bare_origin_is_accepted_unchanged() {
+        assert_eq!(
+            normalise_cors_origin("https://app.example.com").unwrap(),
+            "https://app.example.com"
+        );
+    }
+
+    #[test]
+    fn cors_origin_trailing_slash_is_stripped() {
+        assert_eq!(
+            normalise_cors_origin("https://app.example.com/").unwrap(),
+            "https://app.example.com"
+        );
+    }
+
+    #[test]
+    fn cors_origin_keeps_non_default_port() {
+        assert_eq!(
+            normalise_cors_origin("http://localhost:3001/").unwrap(),
+            "http://localhost:3001"
+        );
+    }
+
+    #[test]
+    fn cors_origin_is_normalised_to_browser_origin_form() {
+        // Browsers send lowercase scheme/host and omit the default port.
+        assert_eq!(
+            normalise_cors_origin("HTTPS://App.Example.com:443/").unwrap(),
+            "https://app.example.com"
+        );
+    }
+
+    #[test]
+    fn cors_origin_with_path_is_rejected() {
+        let err = normalise_cors_origin("https://app.example.com/checkout")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("https://app.example.com/checkout"),
+            "got: {err}"
+        );
+        assert!(err.contains("path"), "got: {err}");
+    }
+
+    #[test]
+    fn cors_origin_without_scheme_is_rejected() {
+        let err = normalise_cors_origin("app.example.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("app.example.com"), "got: {err}");
+    }
+
+    #[test]
+    fn cors_origin_wildcard_is_rejected() {
+        let err = normalise_cors_origin("*").unwrap_err().to_string();
+        assert!(err.contains("wildcard"), "got: {err}");
+    }
+
+    #[test]
+    fn cors_origin_non_http_scheme_is_rejected() {
+        assert!(normalise_cors_origin("ftp://app.example.com").is_err());
+        assert!(normalise_cors_origin("ws://app.example.com").is_err());
+    }
+
+    #[test]
+    fn cors_origin_double_trailing_slash_is_rejected() {
+        assert!(normalise_cors_origin("https://app.example.com//").is_err());
+    }
+
+    #[test]
+    fn cors_origin_query_and_fragment_are_rejected() {
+        assert!(normalise_cors_origin("https://app.example.com?x=1").is_err());
+        assert!(normalise_cors_origin("https://app.example.com#top").is_err());
+        assert!(normalise_cors_origin("https://app.example.com/?").is_err());
+    }
+
+    #[test]
+    fn cors_origin_with_credentials_is_rejected() {
+        assert!(normalise_cors_origin("https://user:pass@app.example.com").is_err());
+    }
+
+    #[test]
+    fn cors_origin_without_host_is_rejected() {
+        assert!(normalise_cors_origin("https://").is_err());
+    }
+
+    #[test]
+    fn startup_normalises_cors_origins_with_trailing_slash() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("public")),
+                ("CORS_ALLOWED_ORIGINS", Some("https://app.example.com/")),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.cors_allowed_origins, vec!["https://app.example.com"]);
+            },
+        );
+    }
+
+    #[test]
+    fn startup_aborts_on_cors_origin_with_path() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("public")),
+                (
+                    "CORS_ALLOWED_ORIGINS",
+                    Some("https://app.example.com,https://app.example.com/checkout"),
+                ),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("CORS_ALLOWED_ORIGINS"), "got: {err}");
+                assert!(err.contains("/checkout"), "got: {err}");
+            },
+        );
+    }
+
+    #[test]
+    fn startup_aborts_on_wildcard_cors_origin() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("CORS_ALLOWED_ORIGINS", Some("*")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("CORS_ALLOWED_ORIGINS"), "got: {err}");
             },
         );
     }
