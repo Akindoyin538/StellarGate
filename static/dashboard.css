@@ -1546,3 +1546,11 @@ dialog::backdrop {
   #payment-invoice, #payment-invoice * { color: black !important; }
   #invoice-qr { break-inside: avoid; }
 }
+
+/* Detail drawer: timeline, shortfall, raw JSON, prev/next (#785-#788) */
+.timeline { list-style: none; margin: 0 0 1rem; padding-inline-start: 1rem; border-inline-start: 2px solid var(--border, #ccc); }
+.timeline li { position: relative; padding: 0.25rem 0 0.5rem 0.5rem; }
+.timeline li::before { content: ""; position: absolute; inset-inline-start: -1.4rem; top: 0.6rem; width: 0.6rem; height: 0.6rem; border-radius: 50%; background: currentColor; }
+.timeline li.timeline-failed { color: #b00020; font-weight: 600; }
+.raw-json pre { max-width: 100%; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+#detail-shortfall { margin-block-end: 1rem; }
