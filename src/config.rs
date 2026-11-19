@@ -416,6 +416,7 @@ impl Config {
     /// - `WEBHOOK_RETRY_DELAY_MS == 0` with retries > 1 → retries hammer the
     ///   target endpoint with no back-off
     /// - `REQUEST_TIMEOUT_SECS == 0` → every request is aborted immediately
+    /// - `WEBHOOK_TIMEOUT_SECS == 0` → every webhook attempt fails immediately
     /// - `DB_BUSY_TIMEOUT_MS == 0` → any write that meets another writer fails
     ///   immediately with `SQLITE_BUSY`
     /// - `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS < WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS`
@@ -506,6 +507,14 @@ impl Config {
                 "STREAM_IDLE_TIMEOUT_SECS must be > 0 (got 0). \
                  A zero timeout would make the stream listener reconnect \
                  continuously instead of tolerating any gap between events."
+            ));
+        }
+
+        if self.webhook_timeout_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_TIMEOUT_SECS must be > 0 (got 0). \
+                 A zero timeout makes every webhook attempt fail immediately, so every \
+                 delivery exhausts its retry budget and ends failed."
             ));
         }
 
@@ -1265,6 +1274,14 @@ mod tests {
         cfg.stream_idle_timeout_secs = 0;
         let err = cfg.validate_timing().unwrap_err().to_string();
         assert!(err.contains("STREAM_IDLE_TIMEOUT_SECS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_rejects_zero_webhook_timeout() {
+        let mut cfg = timing_config();
+        cfg.webhook_timeout_secs = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("WEBHOOK_TIMEOUT_SECS"), "got: {err}");
     }
 
     #[test]
