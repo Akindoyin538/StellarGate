@@ -137,6 +137,12 @@ import { sortPayments } from "./sort.js";
   function writeHashState() {
     try {
       var hash = serializeHash(store.get());
+      var sel = store.get().selectedPaymentId;
+      if (sel) {
+        var qp = new URLSearchParams(hash);
+        qp.set("payment", sel);
+        hash = qp.toString();
+      }
       var base = window.location.pathname;
       var url = base + (hash ? "#" + hash : "");
       window.history.replaceState(null, "", url);
@@ -994,6 +1000,11 @@ import { sortPayments } from "./sort.js";
     clear($("invoice-fields")); clear($("invoice-qr"));
     $("invoice-uri").textContent = "";
     show($("detail-notify"), false);
+    clear($("detail-timeline"));
+    $("detail-shortfall").hidden = true;
+    $("detail-raw-body").textContent = "";
+    writeHash();
+    updateDrawerNav();
     showDetailSkeleton();
     openModal(detail);
     focusDetail();
@@ -1004,6 +1015,9 @@ import { sortPayments } from "./sort.js";
         renderInvoice(p);
         currentDetailPayment = p;
         syncNotifyButton(p);
+        renderShortfall(p);
+        renderRawJson(p);
+        renderTimeline(p, null);
         clear(fields);
         [
           [t("field.status"), p.status, true],
@@ -1051,6 +1065,83 @@ import { sortPayments } from "./sort.js";
       });
 
     loadDeliveries(id);
+  }
+
+  /** Parse a decimal string into integer stroops (7 dp) with BigInt; null if invalid. */
+  function toStroops(v) {
+    var m = /^(\d+)(?:\.(\d{1,7})\d*)?$/.exec(String(v == null ? "" : v).trim());
+    if (!m) return null;
+    return BigInt(m[1]) * 10000000n + BigInt(((m[2] || "") + "0000000").slice(0, 7));
+  }
+
+  function fromStroops(n) {
+    var s = n.toString().padStart(8, "0");
+    return (s.slice(0, -7) + "." + s.slice(-7)).replace(/\.?0+$/, "");
+  }
+
+  function renderShortfall(p) {
+    var box = $("detail-shortfall");
+    var fields = $("shortfall-fields");
+    clear(fields);
+    var expected = toStroops(p.amount);
+    var received = toStroops(p.paid_amount || "0");
+    if (p.status !== "underpaid" || expected === null || received === null) {
+      box.hidden = true;
+      return;
+    }
+    var missing = expected > received ? expected - received : 0n;
+    [
+      ["Expected", fromStroops(expected) + " " + p.asset],
+      ["Received", fromStroops(received) + " " + p.asset],
+      ["Shortfall", fromStroops(missing) + " " + p.asset],
+    ].forEach(function (pair) {
+      fields.appendChild(el("dt", null, pair[0]));
+      fields.appendChild(el("dd", "mono", pair[1]));
+    });
+    box.hidden = false;
+  }
+
+  function renderRawJson(p) {
+    $("detail-raw-body").textContent = JSON.stringify(p, null, 2);
+  }
+
+  /** Vertical lifecycle timeline from payment + delivery timestamps. */
+  function renderTimeline(p, deliveries) {
+    var list = $("detail-timeline");
+    clear(list);
+    var steps = [["Created", p.created_at]];
+    if (p.paid_amount || p.tx_hash) steps.push(["Payment seen", p.updated_at]);
+    if (p.status === "completed") steps.push(["Completed", p.updated_at]);
+    else if (p.status === "underpaid") steps.push(["Underpaid", p.updated_at]);
+    else if (p.status === "expired") steps.push(["Expired", p.expires_at]);
+    steps.forEach(function (s) {
+      list.appendChild(el("li", null, s[0] + " \u00b7 " + fmtTime(s[1])));
+    });
+    (deliveries || []).forEach(function (d) {
+      var failed = d.status === "failed";
+      var li = el("li", failed ? "timeline-failed" : null,
+        (failed ? "\u2716 Webhook failed" : "Webhook " + (d.status || "queued")) +
+        " (" + (d.event || "webhook") + ") \u00b7 " + fmtTime(d.last_attempt || d.created_at));
+      list.appendChild(li);
+    });
+  }
+
+  /** Move the drawer to the previous/next payment in the loaded, filtered list. */
+  function stepDetail(delta) {
+    var id = store.get().selectedPaymentId;
+    var rows = sortedVisiblePayments();
+    var i = rows.findIndex(function (r) { return r.id === id; });
+    var next = rows[i + delta];
+    if (i < 0 || !next) return;
+    openDetail(next.id, state.detailTrigger);
+  }
+
+  function updateDrawerNav() {
+    var id = store.get().selectedPaymentId;
+    var rows = sortedVisiblePayments();
+    var i = rows.findIndex(function (r) { return r.id === id; });
+    $("detail-prev").disabled = i <= 0;
+    $("detail-next").disabled = i < 0 || i >= rows.length - 1;
   }
 
   function renderInvoice(payment) {
@@ -1129,6 +1220,7 @@ import { sortPayments } from "./sort.js";
    */
   function onDetailClosed() {
     store.update({ selectedPaymentId: null });
+    writeHash();
     var detail = $("detail");
     if (detail) detail.classList.remove("detail-open");
     var trigger = state.detailTrigger;
@@ -1180,6 +1272,9 @@ import { sortPayments } from "./sort.js";
         var list = $("deliveries");
         clear(list);
         var deliveries = body.deliveries || [];
+        if (currentDetailPayment && currentDetailPayment.id === paymentId) {
+          renderTimeline(currentDetailPayment, deliveries);
+        }
         show($("deliveries-empty"), deliveries.length === 0);
         if (deliveries.length > 0) {
           deliveries.forEach(function (d) { list.appendChild(deliveryItem(paymentId, d)); });
@@ -1657,10 +1752,11 @@ import { sortPayments } from "./sort.js";
       return;
     }
     ev.preventDefault();
+    var drawerOpen = $("detail") && $("detail").open;
     switch (action) {
       case "refresh":    reload(); break;
-      case "nextRow":    moveActiveRow(1); break;
-      case "prevRow":    moveActiveRow(-1); break;
+      case "nextRow":    if (drawerOpen) stepDetail(1); else moveActiveRow(1); break;
+      case "prevRow":    if (drawerOpen) stepDetail(-1); else moveActiveRow(-1); break;
       case "closeDrawer": closeDetail(); break;
       case "toggleHelp": toggleHelp(); break;
     }
@@ -1821,6 +1917,15 @@ import { sortPayments } from "./sort.js";
         });
       }
       $("detail-close").addEventListener("click", closeDetail);
+      $("detail-prev").addEventListener("click", function () { stepDetail(-1); });
+      $("detail-next").addEventListener("click", function () { stepDetail(1); });
+      $("detail-raw-copy").addEventListener("click", function () {
+        var btn = $("detail-raw-copy");
+        navigator.clipboard.writeText($("detail-raw-body").textContent).then(function () {
+          btn.textContent = "Copied";
+          window.setTimeout(function () { btn.textContent = "Copy"; }, 1500);
+        }).catch(function () {});
+      });
       $("detail").addEventListener("click", dismissOnBackdrop);
       $("detail").addEventListener("keydown", trapDetailFocus);
       $("detail").addEventListener("close", onDetailClosed);
