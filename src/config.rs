@@ -430,10 +430,54 @@ impl Config {
     /// - `WEBHOOK_RETRY_DELAY_MS == 0` with retries > 1 → retries hammer the
     ///   target endpoint with no back-off
     /// - `REQUEST_TIMEOUT_SECS == 0` → every request is aborted immediately
+    /// - `WEBHOOK_TIMEOUT_SECS == 0` → every webhook attempt fails immediately
+    /// - `WEBHOOK_REDRIVE_MAX_ATTEMPTS <= WEBHOOK_RETRY_ATTEMPTS` → the redrive
+    ///   worker never selects an inline-failed delivery
+    /// - `DB_BUSY_TIMEOUT_MS == 0` → any write that meets another writer fails
+    ///   immediately with `SQLITE_BUSY`
+    /// - any negative `WEBHOOK_DELIVERY_RETENTION_DAYS`, `IDEMPOTENCY_RETENTION_DAYS`,
+    ///   `WEBHOOK_REDRIVE_GRACE_SECS`, `WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS` or
+    ///   `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS` → a negative window or delay is never meaningful
     /// - `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS < WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS`
     ///   → the cap would silently override the starting delay, so backoff
     ///   never actually grows
     fn validate_timing(&self) -> Result<()> {
+        /* These are parsed as i64 but are durations or day counts. A negative
+        value is never meaningful: a negative retention builds the SQLite
+        modifier `--5 days`, which makes pruning silently match nothing, and a
+        negative grace or backoff makes redrive eligible immediately, racing
+        in-flight inline dispatches (issue #975). Zero keeps its documented
+        meaning (retention disabled, backoff growth disabled). */
+        for (name, value) in [
+            (
+                "WEBHOOK_DELIVERY_RETENTION_DAYS",
+                self.webhook_delivery_retention_days,
+            ),
+            (
+                "IDEMPOTENCY_RETENTION_DAYS",
+                self.idempotency_retention_days,
+            ),
+            (
+                "WEBHOOK_REDRIVE_GRACE_SECS",
+                self.webhook_redrive_grace_secs,
+            ),
+            (
+                "WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS",
+                self.webhook_redrive_backoff_initial_secs,
+            ),
+            (
+                "WEBHOOK_REDRIVE_BACKOFF_MAX_SECS",
+                self.webhook_redrive_backoff_max_secs,
+            ),
+        ] {
+            if value < 0 {
+                return Err(anyhow::anyhow!(
+                    "{name} must be >= 0 (got {value}). Negative values are never meaningful \
+                     for this setting; use 0 where 0 is documented to disable it."
+                ));
+            }
+        }
+
         if self.poll_interval_secs == 0 {
             return Err(anyhow::anyhow!(
                 "POLL_INTERVAL_SECS must be > 0 (got 0). \
@@ -483,6 +527,21 @@ impl Config {
             ));
         }
 
+        /* WEBHOOK_REDRIVE_MAX_ATTEMPTS is a total that includes the inline
+        attempts already recorded by `dispatch()`. The redrive worker only
+        selects rows with `attempts < WEBHOOK_REDRIVE_MAX_ATTEMPTS`, so a cap at
+        or below the inline budget means no inline-failed delivery is ever
+        redriven, and the worker silently does nothing (issue #974). */
+        if self.webhook_redrive_max_attempts <= self.webhook_retry_attempts {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_MAX_ATTEMPTS ({}) must be > WEBHOOK_RETRY_ATTEMPTS ({}). \
+                 WEBHOOK_REDRIVE_MAX_ATTEMPTS is a total that includes the inline attempts, \
+                 so with this setting no delivery that failed inline would ever be redriven.",
+                self.webhook_redrive_max_attempts,
+                self.webhook_retry_attempts
+            ));
+        }
+
         /* The redrive grace window has to clear the worst case a `dispatch()`
         call can take, or the worker starts a second delivery for a row whose
         first one is still in flight. Making the inline delay exponential
@@ -518,6 +577,23 @@ impl Config {
                 "STREAM_IDLE_TIMEOUT_SECS must be > 0 (got 0). \
                  A zero timeout would make the stream listener reconnect \
                  continuously instead of tolerating any gap between events."
+            ));
+        }
+
+        if self.webhook_timeout_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_TIMEOUT_SECS must be > 0 (got 0). \
+                 A zero timeout makes every webhook attempt fail immediately, so every \
+                 delivery exhausts its retry budget and ends failed."
+            ));
+        }
+
+        if self.db_busy_timeout_ms == 0 {
+            return Err(anyhow::anyhow!(
+                "DB_BUSY_TIMEOUT_MS must be > 0 (got 0). \
+                 A zero busy timeout makes any write that meets another writer fail \
+                 immediately with SQLITE_BUSY, which surfaces as 500s and failed settlements \
+                 under ordinary concurrency."
             ));
         }
 
@@ -1804,6 +1880,57 @@ mod tests {
     }
 
     #[test]
+    fn timing_rejects_redrive_cap_equal_to_inline_attempts() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 3;
+        cfg.webhook_redrive_max_attempts = 3;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(
+            err.contains("WEBHOOK_REDRIVE_MAX_ATTEMPTS") && err.contains("WEBHOOK_RETRY_ATTEMPTS"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_rejects_redrive_cap_below_inline_attempts() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 5;
+        cfg.webhook_redrive_max_attempts = 3;
+        assert!(cfg.validate_timing().is_err());
+    }
+
+    #[test]
+    fn timing_allows_redrive_cap_one_above_inline_attempts() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 3;
+        cfg.webhook_redrive_max_attempts = 4;
+        assert!(cfg.validate_timing().is_ok());
+    }
+
+    #[test]
+    fn timing_rejects_zero_webhook_timeout() {
+        let mut cfg = timing_config();
+        cfg.webhook_timeout_secs = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("WEBHOOK_TIMEOUT_SECS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_rejects_zero_db_busy_timeout() {
+        let mut cfg = timing_config();
+        cfg.db_busy_timeout_ms = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("DB_BUSY_TIMEOUT_MS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_allows_nonzero_db_busy_timeout() {
+        let mut cfg = timing_config();
+        cfg.db_busy_timeout_ms = 1;
+        assert!(cfg.validate_timing().is_ok());
+    }
+
+    #[test]
     fn timing_rejects_zero_ttl() {
         let mut cfg = timing_config();
         cfg.payment_ttl_secs = 0;
@@ -1882,6 +2009,45 @@ mod tests {
         let mut cfg = timing_config();
         cfg.webhook_redrive_backoff_initial_secs = 0;
         cfg.webhook_redrive_backoff_max_secs = 0;
+        assert!(cfg.validate_timing().is_ok());
+    }
+
+    /// Each of the five `i64` settings must reject a negative value and name
+    /// the variable in the error, so the operator knows what to fix.
+    #[test]
+    fn timing_rejects_negative_i64_settings_naming_the_variable() {
+        type Setter = fn(&mut Config, i64);
+        let cases: [(&str, Setter); 5] = [
+            ("WEBHOOK_DELIVERY_RETENTION_DAYS", |c, v| {
+                c.webhook_delivery_retention_days = v
+            }),
+            ("IDEMPOTENCY_RETENTION_DAYS", |c, v| {
+                c.idempotency_retention_days = v
+            }),
+            ("WEBHOOK_REDRIVE_GRACE_SECS", |c, v| {
+                c.webhook_redrive_grace_secs = v
+            }),
+            ("WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS", |c, v| {
+                c.webhook_redrive_backoff_initial_secs = v
+            }),
+            ("WEBHOOK_REDRIVE_BACKOFF_MAX_SECS", |c, v| {
+                c.webhook_redrive_backoff_max_secs = v
+            }),
+        ];
+        for (name, set) in cases {
+            let mut cfg = timing_config();
+            set(&mut cfg, -5);
+            let err = cfg.validate_timing().unwrap_err().to_string();
+            assert!(err.contains(name), "{name}: got: {err}");
+        }
+    }
+
+    /// Zero keeps its documented meaning for the retention windows (disabled).
+    #[test]
+    fn timing_allows_zero_retention_days_to_disable_pruning() {
+        let mut cfg = timing_config();
+        cfg.webhook_delivery_retention_days = 0;
+        cfg.idempotency_retention_days = 0;
         assert!(cfg.validate_timing().is_ok());
     }
 
