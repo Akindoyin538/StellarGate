@@ -421,10 +421,49 @@ impl Config {
     ///   worker never selects an inline-failed delivery
     /// - `DB_BUSY_TIMEOUT_MS == 0` → any write that meets another writer fails
     ///   immediately with `SQLITE_BUSY`
+    /// - any negative `WEBHOOK_DELIVERY_RETENTION_DAYS`, `IDEMPOTENCY_RETENTION_DAYS`,
+    ///   `WEBHOOK_REDRIVE_GRACE_SECS`, `WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS` or
+    ///   `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS` → a negative window or delay is never meaningful
     /// - `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS < WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS`
     ///   → the cap would silently override the starting delay, so backoff
     ///   never actually grows
     fn validate_timing(&self) -> Result<()> {
+        /* These are parsed as i64 but are durations or day counts. A negative
+        value is never meaningful: a negative retention builds the SQLite
+        modifier `--5 days`, which makes pruning silently match nothing, and a
+        negative grace or backoff makes redrive eligible immediately, racing
+        in-flight inline dispatches (issue #975). Zero keeps its documented
+        meaning (retention disabled, backoff growth disabled). */
+        for (name, value) in [
+            (
+                "WEBHOOK_DELIVERY_RETENTION_DAYS",
+                self.webhook_delivery_retention_days,
+            ),
+            (
+                "IDEMPOTENCY_RETENTION_DAYS",
+                self.idempotency_retention_days,
+            ),
+            (
+                "WEBHOOK_REDRIVE_GRACE_SECS",
+                self.webhook_redrive_grace_secs,
+            ),
+            (
+                "WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS",
+                self.webhook_redrive_backoff_initial_secs,
+            ),
+            (
+                "WEBHOOK_REDRIVE_BACKOFF_MAX_SECS",
+                self.webhook_redrive_backoff_max_secs,
+            ),
+        ] {
+            if value < 0 {
+                return Err(anyhow::anyhow!(
+                    "{name} must be >= 0 (got {value}). Negative values are never meaningful \
+                     for this setting; use 0 where 0 is documented to disable it."
+                ));
+            }
+        }
+
         if self.poll_interval_secs == 0 {
             return Err(anyhow::anyhow!(
                 "POLL_INTERVAL_SECS must be > 0 (got 0). \
@@ -1423,6 +1462,45 @@ mod tests {
         let mut cfg = timing_config();
         cfg.webhook_redrive_backoff_initial_secs = 0;
         cfg.webhook_redrive_backoff_max_secs = 0;
+        assert!(cfg.validate_timing().is_ok());
+    }
+
+    /// Each of the five `i64` settings must reject a negative value and name
+    /// the variable in the error, so the operator knows what to fix.
+    #[test]
+    fn timing_rejects_negative_i64_settings_naming_the_variable() {
+        type Setter = fn(&mut Config, i64);
+        let cases: [(&str, Setter); 5] = [
+            ("WEBHOOK_DELIVERY_RETENTION_DAYS", |c, v| {
+                c.webhook_delivery_retention_days = v
+            }),
+            ("IDEMPOTENCY_RETENTION_DAYS", |c, v| {
+                c.idempotency_retention_days = v
+            }),
+            ("WEBHOOK_REDRIVE_GRACE_SECS", |c, v| {
+                c.webhook_redrive_grace_secs = v
+            }),
+            ("WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS", |c, v| {
+                c.webhook_redrive_backoff_initial_secs = v
+            }),
+            ("WEBHOOK_REDRIVE_BACKOFF_MAX_SECS", |c, v| {
+                c.webhook_redrive_backoff_max_secs = v
+            }),
+        ];
+        for (name, set) in cases {
+            let mut cfg = timing_config();
+            set(&mut cfg, -5);
+            let err = cfg.validate_timing().unwrap_err().to_string();
+            assert!(err.contains(name), "{name}: got: {err}");
+        }
+    }
+
+    /// Zero keeps its documented meaning for the retention windows (disabled).
+    #[test]
+    fn timing_allows_zero_retention_days_to_disable_pruning() {
+        let mut cfg = timing_config();
+        cfg.webhook_delivery_retention_days = 0;
+        cfg.idempotency_retention_days = 0;
         assert!(cfg.validate_timing().is_ok());
     }
 
