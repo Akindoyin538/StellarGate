@@ -25,7 +25,9 @@ import {
   countdown as _countdown,
   CSV_COLUMNS,
   explorerTx as _explorerTx,
-  fmtTime,
+  fmtTime as _fmtTime,
+  formatAmountLocale,
+  newPaymentIds,
   formatAmount as _formatAmount,
   pillClass,
   relativeTime as _relativeTime,
@@ -112,7 +114,17 @@ import { sortPayments } from "./sort.js";
   // helper is defined (the test checks for `function name(` in this file).
 
   /** Format a payment amount with its asset code. @see format.js */
-  function formatAmount(amount, asset) { return _formatAmount(amount, asset); }
+  function formatAmount(amount, asset) {
+    return formatAmountLocale(amount, asset, document.documentElement.lang || undefined);
+  }
+
+  /** Active display zone: "local" or "utc" (#783). */
+  function activeZone() {
+    return prefs.get().timezone === "utc" ? "utc" : "local";
+  }
+
+  /** Timestamp in the active zone, zone name included. @see format.js */
+  function fmtTime(iso) { return _fmtTime(iso, activeZone()); }
 
   /** Coarse countdown to an ISO instant. @see format.js */
   function countdown(iso, now) { return _countdown(iso, now); }
@@ -272,7 +284,7 @@ import { sortPayments } from "./sort.js";
     if (interval) interval.value = String(p.refreshIntervalSec);
     var theme = $("prefs-theme");
     if (theme) theme.value = p.theme || "system";
-    var tz = $("prefs-timezone");
+    var tz = $("prefs-timezone") || $("settings-timezone");
     if (tz) tz.value = p.timezone || "local";
     syncColumnMenuUi();
   }
@@ -426,7 +438,7 @@ import { sortPayments } from "./sort.js";
       });
     }
 
-    var tz = $("prefs-timezone");
+    var tz = $("prefs-timezone") || $("settings-timezone");
     if (tz) {
       tz.addEventListener("change", function () {
         prefs.update({ timezone: tz.value });
@@ -590,6 +602,8 @@ import { sortPayments } from "./sort.js";
   }
 
   function reload() {
+    /* Everything shown (or seen) before this refresh is "old". */
+    seenIds = Object.assign({}, seenIds || {}, seenAccum);
     store.resetPaging();
     store.update({ loadedPayments: [] });
     clear($("rows"));
@@ -617,6 +631,7 @@ import { sortPayments } from "./sort.js";
         if (stamp) stamp.textContent = "Last updated " + fmtTime(new Date().toISOString());
         var payments = body.payments || [];
         notifyWatchedPayments(payments);
+        markNewRows(payments, isFirstPage);
         var rows = store.get().loadedPayments.concat(payments);
         store.update({ loadedPayments: rows });
         renderRows();
@@ -671,6 +686,27 @@ import { sortPayments } from "./sort.js";
         clear($("summary"));
         announce("Error loading summary: " + err.message);
       });
+  }
+
+  // ── New-since-refresh highlight (#781) ────────────────────────────────────
+  var seenIds = null;     // ids known before the current refresh; null on first load
+  var newIds = {};
+  var seenAccum = {};
+
+  /** Record this page's ids; flag ones unseen before the refresh and announce the count. */
+  function markNewRows(payments, isFirstPage) {
+    var fresh = seenIds && isFirstPage ? newPaymentIds(seenIds, payments) : [];
+    fresh.forEach(function (id) { newIds[id] = true; });
+    payments.forEach(function (p) { seenAccum[p.id] = true; });
+    if (fresh.length) {
+      announce(fresh.length + (fresh.length === 1 ? " new payment" : " new payments"));
+      window.setTimeout(function () {
+        fresh.forEach(function (id) { delete newIds[id]; });
+        Array.prototype.forEach.call(document.querySelectorAll("tr.row-new"), function (tr) {
+          tr.classList.remove("row-new");
+        });
+      }, 4000);
+    }
   }
 
   function renderRows() {
@@ -876,6 +912,7 @@ import { sortPayments } from "./sort.js";
     var tr = document.createElement("tr");
     tr.tabIndex = 0;
     tr.dataset.paymentId = p.id;
+    if (newIds[p.id]) tr.classList.add("row-new");
     if (isActive) {
       tr.className = "row-active";
       tr.setAttribute("aria-current", "true");
@@ -1473,7 +1510,7 @@ import { sortPayments } from "./sort.js";
   // ── Export ────────────────────────────────────────────────────────────────
 
   function exportCsv(payments, filename) {
-    var csv = toCsv(payments, CSV_COLUMNS);
+    var csv = toCsv(payments, CSV_COLUMNS, activeZone());
     var blob = new Blob([csv], { type: "text/csv" });
     var url = URL.createObjectURL(blob);
     var a = document.createElement("a");
@@ -1607,6 +1644,11 @@ import { sortPayments } from "./sort.js";
 
     var auto = $("auto-refresh");
     if (auto) auto.checked = state.autoRefresh;
+
+    var minA = $("min-amount");
+    if (minA && minA.value !== state.minAmount) minA.value = state.minAmount;
+    var maxA = $("max-amount");
+    if (maxA && maxA.value !== state.maxAmount) maxA.value = state.maxAmount;
 
     syncPresetUi();
   }
@@ -1790,6 +1832,18 @@ import { sortPayments } from "./sort.js";
         syncSearchClear();
       });
     }
+
+    ["min-amount", "max-amount"].forEach(function (id) {
+      var input = $(id);
+      if (!input) return;
+      input.addEventListener("input", function () {
+        store.update({ minAmount: $("min-amount").value.trim(), maxAmount: $("max-amount").value.trim() });
+        store.clampActiveRow();
+        renderRows();
+        var note = $("amount-filter-note");
+        if (note) note.hidden = !(store.get().minAmount || store.get().maxAmount);
+      });
+    });
 
     $("load-more").addEventListener("click", function () {
       store.update({ activeRow: -1 });
