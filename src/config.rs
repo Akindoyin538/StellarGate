@@ -240,7 +240,8 @@ impl Config {
             std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:stellargate.db".to_string());
         let network = std::env::var("STELLAR_NETWORK").unwrap_or_else(|_| "testnet".to_string());
         let horizon_url = std::env::var("STELLAR_HORIZON_URL")
-            .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string());
+            .unwrap_or_else(|_| default_horizon_url(&network).to_string());
+        validate_network_horizon(&network, &horizon_url)?;
         let gateway_public =
             std::env::var("STELLAR_GATEWAY_PUBLIC").unwrap_or_else(|_| "UNCONFIGURED".to_string());
         let webhook_secret = Self::validate_webhook_secret(std::env::var("WEBHOOK_SECRET"))?;
@@ -804,6 +805,56 @@ impl std::fmt::Debug for Config {
     }
 }
 
+/// The Horizon endpoint used when `STELLAR_HORIZON_URL` is unset, chosen to
+/// match `STELLAR_NETWORK`. Without this, a `public` gateway with no explicit
+/// Horizon URL silently watched the testnet ledger for mainnet accounts
+/// (issue #969).
+fn default_horizon_url(network: &str) -> &'static str {
+    if network == "public" {
+        "https://horizon.stellar.org"
+    } else {
+        "https://horizon-testnet.stellar.org"
+    }
+}
+
+/// Check that `STELLAR_NETWORK` and `STELLAR_HORIZON_URL` name the same
+/// network (issue #969).
+///
+/// - `public` with a testnet Horizon is refused at boot: the gateway would
+///   never see a real payment, and nothing else would flag it.
+/// - `testnet` with the mainnet Horizon is allowed but logged as a warning,
+///   since it is almost certainly a copy-paste mistake.
+///
+/// The check is a heuristic on the URL text. Horizon hosts name their network
+/// (`horizon-testnet.stellar.org` vs `horizon.stellar.org`), so this catches
+/// the standard endpoints; a custom proxy with an unrelated hostname is not
+/// classified.
+fn validate_network_horizon(network: &str, horizon_url: &str) -> Result<()> {
+    let lower = horizon_url.to_ascii_lowercase();
+    let is_testnet_horizon = lower.contains("testnet");
+    let is_mainnet_horizon = lower.contains("horizon.stellar.org") && !is_testnet_horizon;
+
+    if network == "public" && is_testnet_horizon {
+        return Err(anyhow::anyhow!(
+            "STELLAR_HORIZON_URL={horizon_url:?} is a testnet Horizon, but \
+             STELLAR_NETWORK=public. The gateway would watch the testnet ledger for \
+             mainnet accounts and never detect real payments. Set \
+             STELLAR_HORIZON_URL=https://horizon.stellar.org (or your mainnet Horizon \
+             endpoint), or remove it to use the mainnet default."
+        ));
+    }
+
+    if network == "testnet" && is_mainnet_horizon {
+        tracing::warn!(
+            horizon_url = %horizon_url,
+            "STELLAR_NETWORK=testnet but STELLAR_HORIZON_URL points at the mainnet \
+             Horizon. Testnet accounts will not be found there; check both settings."
+        );
+    }
+
+    Ok(())
+}
+
 /// Parse `TRUSTED_PROXY_CIDRS`: a comma-separated list of CIDR blocks (IPv4 or
 /// IPv6), e.g. `TRUSTED_PROXY_CIDRS=10.0.0.0/8,192.168.1.0/24`. Empty/unset
 /// means no trusted proxies, in which case forwarding headers are ignored
@@ -988,6 +1039,109 @@ mod tests {
                     "boot on public without ACCEPTED_ASSETS accepted the testnet issuer: {:?}",
                     cfg.accepted_assets
                 );
+            },
+        );
+    }
+
+    // ── issue #969: STELLAR_HORIZON_URL default and network mismatch ─────────
+
+    #[test]
+    fn default_horizon_url_follows_network() {
+        assert_eq!(default_horizon_url("public"), "https://horizon.stellar.org");
+        assert_eq!(
+            default_horizon_url("testnet"),
+            "https://horizon-testnet.stellar.org"
+        );
+    }
+
+    #[test]
+    fn public_network_without_horizon_url_uses_mainnet_horizon() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("public")),
+                ("CORS_ALLOWED_ORIGINS", Some("https://example.com")),
+                ("STELLAR_HORIZON_URL", None),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.horizon_url, "https://horizon.stellar.org");
+            },
+        );
+    }
+
+    #[test]
+    fn testnet_network_without_horizon_url_uses_testnet_horizon() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("STELLAR_HORIZON_URL", None),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.horizon_url, "https://horizon-testnet.stellar.org");
+            },
+        );
+    }
+
+    #[test]
+    fn public_network_with_testnet_horizon_aborts_boot() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("public")),
+                ("CORS_ALLOWED_ORIGINS", Some("https://example.com")),
+                (
+                    "STELLAR_HORIZON_URL",
+                    Some("https://horizon-testnet.stellar.org"),
+                ),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("STELLAR_HORIZON_URL") && err.contains("STELLAR_NETWORK=public"),
+                    "error must name both settings; got: {err}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn testnet_network_with_mainnet_horizon_warns_but_boots() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("STELLAR_HORIZON_URL", Some("https://horizon.stellar.org")),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.horizon_url, "https://horizon.stellar.org");
+                assert!(
+                    logs_contain("STELLAR_HORIZON_URL"),
+                    "testnet + mainnet Horizon must log a mismatch warning"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn matching_horizon_url_does_not_warn() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                (
+                    "STELLAR_HORIZON_URL",
+                    Some("https://horizon-testnet.stellar.org"),
+                ),
+            ],
+            || {
+                Config::from_env().unwrap();
+                assert!(!logs_contain("mainnet Horizon"));
             },
         );
     }

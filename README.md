@@ -264,7 +264,7 @@ All configuration is via environment variables, read once at startup. **Invalid 
 | `PORT` | HTTP listen port | `3000` |
 | `DATABASE_URL` | sqlx connection string (not a file path) | `sqlite:stellargate.db` |
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
-| `STELLAR_HORIZON_URL` | Horizon endpoint | testnet Horizon |
+| `STELLAR_HORIZON_URL` | Horizon endpoint. Defaults to match `STELLAR_NETWORK`: `https://horizon.stellar.org` on `public`, `https://horizon-testnet.stellar.org` otherwise. On `public`, a testnet Horizon URL aborts boot; on `testnet`, the mainnet Horizon logs a warning (issue #969). | per `STELLAR_NETWORK` (see description) |
 | `STELLAR_GATEWAY_PUBLIC` | Gateway wallet public key (`G…`), validated as a strkey at startup. The listener stays idle until this is set. | — |
 | `ACCEPTED_ASSETS` | Comma-separated. Only native XLM may be written as a bare `CODE`. Every other asset is `CODE:ISSUER` (`USDC:GA…`). A typo like `ACCEPTED_ASSETS=XLM,USDC` used to treat native XLM as settling USDC intents; boot now refuses it (issue #221). Duplicate codes are also refused (issue #222). Each issuer is strkey-validated. Adding an asset is config-only — but see [Trustlines](#trustlines). | `XLM,USDC:<testnet issuer>` on `testnet`; `XLM` only on `public` (the testnet USDC issuer is never accepted by default on mainnet — set `ACCEPTED_ASSETS` explicitly to accept a mainnet asset) |
 | `REQUEST_TIMEOUT_SECS` | Whole-request timeout; exceeding it returns `408` | `30` |
