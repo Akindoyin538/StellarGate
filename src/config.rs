@@ -65,17 +65,33 @@ impl AcceptedAsset {
             .collect()
     }
 
-    pub fn default_list() -> Vec<Self> {
-        vec![
-            AcceptedAsset {
-                code: "XLM".into(),
-                issuer: None,
-            },
-            AcceptedAsset {
+    /// The default allow-list used when `ACCEPTED_ASSETS` is unset, for the
+    /// given `STELLAR_NETWORK` value.
+    ///
+    /// - `testnet` (and any non-`public` network): native XLM plus Circle's
+    ///   testnet USDC issuer.
+    /// - `public`: native XLM only. The testnet USDC issuer holds no real USDC
+    ///   on mainnet, so accepting it by default would price intents in an
+    ///   asset real customers can never pay with (issue #968). Mainnet assets
+    ///   must be opted into explicitly via `ACCEPTED_ASSETS`.
+    pub fn default_list_for_network(network: &str) -> Vec<Self> {
+        let mut assets = vec![AcceptedAsset {
+            code: "XLM".into(),
+            issuer: None,
+        }];
+        if network != "public" {
+            assets.push(AcceptedAsset {
                 code: "USDC".into(),
                 issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
-            },
-        ]
+            });
+        }
+        assets
+    }
+
+    /// The testnet default allow-list. Equivalent to
+    /// `default_list_for_network("testnet")`.
+    pub fn default_list() -> Vec<Self> {
+        Self::default_list_for_network("testnet")
     }
 }
 
@@ -224,19 +240,14 @@ impl Config {
             std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:stellargate.db".to_string());
         let network = std::env::var("STELLAR_NETWORK").unwrap_or_else(|_| "testnet".to_string());
         let horizon_url = std::env::var("STELLAR_HORIZON_URL")
-            .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string());
+            .unwrap_or_else(|_| default_horizon_url(&network).to_string());
+        validate_network_horizon(&network, &horizon_url)?;
         let gateway_public =
             std::env::var("STELLAR_GATEWAY_PUBLIC").unwrap_or_else(|_| "UNCONFIGURED".to_string());
         let webhook_secret = Self::validate_webhook_secret(std::env::var("WEBHOOK_SECRET"))?;
-        let allowed_webhook_schemes: Vec<String> = {
-            let raw_schemes =
-                std::env::var("ALLOWED_WEBHOOK_SCHEMES").unwrap_or_else(|_| "https".to_string());
-            raw_schemes
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        };
+        let allowed_webhook_schemes = parse_webhook_schemes(
+            &std::env::var("ALLOWED_WEBHOOK_SCHEMES").unwrap_or_else(|_| "https".to_string()),
+        )?;
 
         /* Independent of network: HTTPS is enforced unconditionally on
         `public` regardless of this list, but on any other network an
@@ -250,28 +261,16 @@ impl Config {
             );
         }
 
-        let cors_allowed_origins: Vec<String> = {
-            let raw_origins: Vec<String> = std::env::var("CORS_ALLOWED_ORIGINS")
-                .unwrap_or_default()
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect();
-
-            // Validate every configured origin now so a typo aborts boot with
-            // a clear message instead of silently removing the origin from the
-            // allowlist (or producing an empty allowlist with no error).
-            for origin in &raw_origins {
-                origin.parse::<axum::http::HeaderValue>().map_err(|e| {
-                    anyhow::anyhow!(
-                        "CORS_ALLOWED_ORIGINS contains an invalid origin {origin:?}: {e}. \
-                         Fix or remove the bad entry."
-                    )
-                })?;
-            }
-            raw_origins
-        };
+        // Every entry is validated and normalised now, so a bad entry aborts
+        // boot with a clear message instead of silently never matching a
+        // browser's `Origin` header (issue #970).
+        let cors_allowed_origins: Vec<String> = std::env::var("CORS_ALLOWED_ORIGINS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(normalise_cors_origin)
+            .collect::<Result<Vec<String>>>()?;
 
         if network == "public" && cors_allowed_origins.is_empty() {
             return Err(anyhow::anyhow!(
@@ -316,20 +315,35 @@ impl Config {
             Self::validate_admin_secret(std::env::var("ADMIN_PROVISIONING_SECRET"))?;
         let metrics_token = Self::validate_metrics_token(std::env::var("METRICS_TOKEN"))?;
 
+        // Computed before `network` is moved into the struct below.
+        let accepted_assets = {
+            let raw = std::env::var("ACCEPTED_ASSETS").unwrap_or_default();
+            if raw.is_empty() {
+                AcceptedAsset::default_list_for_network(&network)
+            } else {
+                AcceptedAsset::parse_list(&raw)
+            }
+        };
+        tracing::info!(
+            network = %network,
+            accepted_assets = %accepted_assets
+                .iter()
+                .map(|a| match &a.issuer {
+                    Some(issuer) => format!("{}:{issuer}", a.code),
+                    None => a.code.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            "effective ACCEPTED_ASSETS allow-list"
+        );
+
         let config = Self {
             port: parse_env("PORT", 3000)?,
             database_url,
             network,
             horizon_url,
             gateway_public,
-            accepted_assets: {
-                let raw = std::env::var("ACCEPTED_ASSETS").unwrap_or_default();
-                if raw.is_empty() {
-                    AcceptedAsset::default_list()
-                } else {
-                    AcceptedAsset::parse_list(&raw)
-                }
-            },
+            accepted_assets,
             webhook_secret,
             allowed_webhook_schemes,
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3)?,
@@ -773,6 +787,140 @@ impl std::fmt::Debug for Config {
     }
 }
 
+/// Validate one `CORS_ALLOWED_ORIGINS` entry and return its canonical form
+/// (issue #970).
+///
+/// Browsers send `Origin` as `scheme://host[:port]`, with no path, query,
+/// fragment, credentials or trailing slash. An entry in any other shape passed
+/// the old header-value check but never matched a request, so the dashboard or
+/// merchant frontend failed with an opaque CORS error. Those entries are
+/// rejected here instead.
+///
+/// One trailing `/` is tolerated and stripped, since it is the most common
+/// copy-paste form. The result is the serialised origin, so
+/// `HTTPS://App.Example.com:443/` becomes `https://app.example.com`, the same
+/// string a browser sends.
+fn normalise_cors_origin(entry: &str) -> Result<String> {
+    let invalid = |reason: &str| {
+        anyhow::anyhow!(
+            "CORS_ALLOWED_ORIGINS contains an invalid origin {entry:?}: {reason}. \
+             Use the form https://app.example.com (scheme, host and optional port, \
+             no path). Fix or remove the bad entry."
+        )
+    };
+
+    if entry == "*" {
+        return Err(invalid(
+            "wildcards are not supported; list each origin explicitly",
+        ));
+    }
+
+    let candidate = entry.strip_suffix('/').unwrap_or(entry);
+    if candidate.ends_with('/') {
+        return Err(invalid("more than one trailing slash"));
+    }
+
+    let url = reqwest::Url::parse(candidate)
+        .map_err(|_| invalid("expected a full URL with a scheme, e.g. https://app.example.com"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(invalid("the scheme must be http or https"));
+    }
+    if url.host_str().is_none() {
+        return Err(invalid("the host is missing"));
+    }
+    if url.path() != "/" {
+        return Err(invalid("a path is not allowed"));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(invalid("query strings and fragments are not allowed"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid("credentials are not allowed"));
+    }
+
+    Ok(url.origin().ascii_serialization())
+}
+
+/// The Horizon endpoint used when `STELLAR_HORIZON_URL` is unset, chosen to
+/// match `STELLAR_NETWORK`. Without this, a `public` gateway with no explicit
+/// Horizon URL silently watched the testnet ledger for mainnet accounts
+/// (issue #969).
+fn default_horizon_url(network: &str) -> &'static str {
+    if network == "public" {
+        "https://horizon.stellar.org"
+    } else {
+        "https://horizon-testnet.stellar.org"
+    }
+}
+
+/// Check that `STELLAR_NETWORK` and `STELLAR_HORIZON_URL` name the same
+/// network (issue #969).
+///
+/// - `public` with a testnet Horizon is refused at boot: the gateway would
+///   never see a real payment, and nothing else would flag it.
+/// - `testnet` with the mainnet Horizon is allowed but logged as a warning,
+///   since it is almost certainly a copy-paste mistake.
+///
+/// The check is a heuristic on the URL text. Horizon hosts name their network
+/// (`horizon-testnet.stellar.org` vs `horizon.stellar.org`), so this catches
+/// the standard endpoints; a custom proxy with an unrelated hostname is not
+/// classified.
+fn validate_network_horizon(network: &str, horizon_url: &str) -> Result<()> {
+    let lower = horizon_url.to_ascii_lowercase();
+    let is_testnet_horizon = lower.contains("testnet");
+    let is_mainnet_horizon = lower.contains("horizon.stellar.org") && !is_testnet_horizon;
+
+    if network == "public" && is_testnet_horizon {
+        return Err(anyhow::anyhow!(
+            "STELLAR_HORIZON_URL={horizon_url:?} is a testnet Horizon, but \
+             STELLAR_NETWORK=public. The gateway would watch the testnet ledger for \
+             mainnet accounts and never detect real payments. Set \
+             STELLAR_HORIZON_URL=https://horizon.stellar.org (or your mainnet Horizon \
+             endpoint), or remove it to use the mainnet default."
+        ));
+    }
+
+    if network == "testnet" && is_mainnet_horizon {
+        tracing::warn!(
+            horizon_url = %horizon_url,
+            "STELLAR_NETWORK=testnet but STELLAR_HORIZON_URL points at the mainnet \
+             Horizon. Testnet accounts will not be found there; check both settings."
+        );
+    }
+
+    Ok(())
+}
+
+/// Parse `ALLOWED_WEBHOOK_SCHEMES` (issue #971).
+///
+/// Entries are trimmed and lowercased. `reqwest::Url` always lowercases the
+/// scheme it parses, so a stored `HTTPS` would reject every `https://` webhook
+/// URL. Only `http` and `https` are accepted, because the SSRF guard permits
+/// no other scheme and any other entry could never be used. An empty list is
+/// refused, because it would reject every webhook.
+fn parse_webhook_schemes(raw: &str) -> Result<Vec<String>> {
+    let mut schemes: Vec<String> = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let scheme = entry.to_ascii_lowercase();
+        if !matches!(scheme.as_str(), "http" | "https") {
+            return Err(anyhow::anyhow!(
+                "ALLOWED_WEBHOOK_SCHEMES contains an unsupported scheme {entry:?}. \
+                 Only \"http\" and \"https\" are supported. Fix or remove the bad entry."
+            ));
+        }
+        if !schemes.contains(&scheme) {
+            schemes.push(scheme);
+        }
+    }
+    if schemes.is_empty() {
+        return Err(anyhow::anyhow!(
+            "ALLOWED_WEBHOOK_SCHEMES is empty, so every webhook_url would be rejected. \
+             Set it to \"https\", or unset it to use the default."
+        ));
+    }
+    Ok(schemes)
+}
+
 /// Parse `TRUSTED_PROXY_CIDRS`: a comma-separated list of CIDR blocks (IPv4 or
 /// IPv6), e.g. `TRUSTED_PROXY_CIDRS=10.0.0.0/8,192.168.1.0/24`. Empty/unset
 /// means no trusted proxies, in which case forwarding headers are ignored
@@ -903,6 +1051,404 @@ mod tests {
                 code: "EURC".into(),
                 issuer: Some("GISSUER2".into())
             }
+        );
+    }
+
+    const TESTNET_USDC_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+    #[test]
+    fn default_assets_on_testnet_include_testnet_usdc() {
+        let assets = AcceptedAsset::default_list_for_network("testnet");
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets[0].code, "XLM");
+        assert_eq!(assets[0].issuer, None);
+        assert_eq!(assets[1].code, "USDC");
+        assert_eq!(assets[1].issuer.as_deref(), Some(TESTNET_USDC_ISSUER));
+        assert_eq!(AcceptedAsset::default_list(), assets);
+    }
+
+    #[test]
+    fn default_assets_on_public_are_xlm_only() {
+        // Issue #968: the testnet USDC issuer must never be accepted by default
+        // on mainnet, where it holds no real USDC.
+        let assets = AcceptedAsset::default_list_for_network("public");
+        assert_eq!(
+            assets,
+            vec![AcceptedAsset {
+                code: "XLM".into(),
+                issuer: None
+            }]
+        );
+        assert!(
+            assets
+                .iter()
+                .all(|a| a.issuer.as_deref() != Some(TESTNET_USDC_ISSUER)),
+            "public default must not contain the testnet USDC issuer"
+        );
+    }
+
+    #[test]
+    fn public_network_without_accepted_assets_never_accepts_testnet_issuer() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("public")),
+                ("CORS_ALLOWED_ORIGINS", Some("https://example.com")),
+                ("ACCEPTED_ASSETS", None),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert!(
+                    cfg.accepted_assets
+                        .iter()
+                        .all(|a| a.issuer.as_deref() != Some(TESTNET_USDC_ISSUER)),
+                    "boot on public without ACCEPTED_ASSETS accepted the testnet issuer: {:?}",
+                    cfg.accepted_assets
+                );
+            },
+        );
+    }
+
+    // ── issue #969: STELLAR_HORIZON_URL default and network mismatch ─────────
+
+    #[test]
+    fn default_horizon_url_follows_network() {
+        assert_eq!(default_horizon_url("public"), "https://horizon.stellar.org");
+        assert_eq!(
+            default_horizon_url("testnet"),
+            "https://horizon-testnet.stellar.org"
+        );
+    }
+
+    #[test]
+    fn public_network_without_horizon_url_uses_mainnet_horizon() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("public")),
+                ("CORS_ALLOWED_ORIGINS", Some("https://example.com")),
+                ("STELLAR_HORIZON_URL", None),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.horizon_url, "https://horizon.stellar.org");
+            },
+        );
+    }
+
+    #[test]
+    fn testnet_network_without_horizon_url_uses_testnet_horizon() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("STELLAR_HORIZON_URL", None),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.horizon_url, "https://horizon-testnet.stellar.org");
+            },
+        );
+    }
+
+    #[test]
+    fn public_network_with_testnet_horizon_aborts_boot() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("public")),
+                ("CORS_ALLOWED_ORIGINS", Some("https://example.com")),
+                (
+                    "STELLAR_HORIZON_URL",
+                    Some("https://horizon-testnet.stellar.org"),
+                ),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("STELLAR_HORIZON_URL") && err.contains("STELLAR_NETWORK=public"),
+                    "error must name both settings; got: {err}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn testnet_network_with_mainnet_horizon_warns_but_boots() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("STELLAR_HORIZON_URL", Some("https://horizon.stellar.org")),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.horizon_url, "https://horizon.stellar.org");
+                assert!(
+                    logs_contain("STELLAR_HORIZON_URL"),
+                    "testnet + mainnet Horizon must log a mismatch warning"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn matching_horizon_url_does_not_warn() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                (
+                    "STELLAR_HORIZON_URL",
+                    Some("https://horizon-testnet.stellar.org"),
+                ),
+            ],
+            || {
+                Config::from_env().unwrap();
+                assert!(!logs_contain("mainnet Horizon"));
+            },
+        );
+    }
+
+    // ── issue #970: CORS_ALLOWED_ORIGINS must be bare origins ────────────────
+
+    #[test]
+    fn cors_origin_bare_origin_is_accepted_unchanged() {
+        assert_eq!(
+            normalise_cors_origin("https://app.example.com").unwrap(),
+            "https://app.example.com"
+        );
+    }
+
+    #[test]
+    fn cors_origin_trailing_slash_is_stripped() {
+        assert_eq!(
+            normalise_cors_origin("https://app.example.com/").unwrap(),
+            "https://app.example.com"
+        );
+    }
+
+    #[test]
+    fn cors_origin_keeps_non_default_port() {
+        assert_eq!(
+            normalise_cors_origin("http://localhost:3001/").unwrap(),
+            "http://localhost:3001"
+        );
+    }
+
+    #[test]
+    fn cors_origin_is_normalised_to_browser_origin_form() {
+        // Browsers send lowercase scheme/host and omit the default port.
+        assert_eq!(
+            normalise_cors_origin("HTTPS://App.Example.com:443/").unwrap(),
+            "https://app.example.com"
+        );
+    }
+
+    #[test]
+    fn cors_origin_with_path_is_rejected() {
+        let err = normalise_cors_origin("https://app.example.com/checkout")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("https://app.example.com/checkout"),
+            "got: {err}"
+        );
+        assert!(err.contains("path"), "got: {err}");
+    }
+
+    #[test]
+    fn cors_origin_without_scheme_is_rejected() {
+        let err = normalise_cors_origin("app.example.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("app.example.com"), "got: {err}");
+    }
+
+    #[test]
+    fn cors_origin_wildcard_is_rejected() {
+        let err = normalise_cors_origin("*").unwrap_err().to_string();
+        assert!(err.contains("wildcard"), "got: {err}");
+    }
+
+    #[test]
+    fn cors_origin_non_http_scheme_is_rejected() {
+        assert!(normalise_cors_origin("ftp://app.example.com").is_err());
+        assert!(normalise_cors_origin("ws://app.example.com").is_err());
+    }
+
+    #[test]
+    fn cors_origin_double_trailing_slash_is_rejected() {
+        assert!(normalise_cors_origin("https://app.example.com//").is_err());
+    }
+
+    #[test]
+    fn cors_origin_query_and_fragment_are_rejected() {
+        assert!(normalise_cors_origin("https://app.example.com?x=1").is_err());
+        assert!(normalise_cors_origin("https://app.example.com#top").is_err());
+        assert!(normalise_cors_origin("https://app.example.com/?").is_err());
+    }
+
+    #[test]
+    fn cors_origin_with_credentials_is_rejected() {
+        assert!(normalise_cors_origin("https://user:pass@app.example.com").is_err());
+    }
+
+    #[test]
+    fn cors_origin_without_host_is_rejected() {
+        assert!(normalise_cors_origin("https://").is_err());
+    }
+
+    #[test]
+    fn startup_normalises_cors_origins_with_trailing_slash() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("public")),
+                ("CORS_ALLOWED_ORIGINS", Some("https://app.example.com/")),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.cors_allowed_origins, vec!["https://app.example.com"]);
+            },
+        );
+    }
+
+    #[test]
+    fn startup_aborts_on_cors_origin_with_path() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("public")),
+                (
+                    "CORS_ALLOWED_ORIGINS",
+                    Some("https://app.example.com,https://app.example.com/checkout"),
+                ),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("CORS_ALLOWED_ORIGINS"), "got: {err}");
+                assert!(err.contains("/checkout"), "got: {err}");
+            },
+        );
+    }
+
+    #[test]
+    fn startup_aborts_on_wildcard_cors_origin() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("CORS_ALLOWED_ORIGINS", Some("*")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("CORS_ALLOWED_ORIGINS"), "got: {err}");
+            },
+        );
+    }
+
+    // ── issue #971: ALLOWED_WEBHOOK_SCHEMES normalisation and validation ─────
+
+    #[test]
+    fn webhook_schemes_are_lowercased() {
+        assert_eq!(parse_webhook_schemes("HTTPS").unwrap(), vec!["https"]);
+        assert_eq!(
+            parse_webhook_schemes("https,HTTP").unwrap(),
+            vec!["https", "http"]
+        );
+    }
+
+    #[test]
+    fn webhook_schemes_trim_and_deduplicate() {
+        assert_eq!(
+            parse_webhook_schemes(" https , https ,, ").unwrap(),
+            vec!["https"]
+        );
+    }
+
+    #[test]
+    fn webhook_schemes_reject_unsupported_scheme() {
+        for raw in ["ftp", "ws", "https,ftp", "file"] {
+            let err = parse_webhook_schemes(raw).unwrap_err().to_string();
+            assert!(
+                err.contains("unsupported scheme") && err.contains("ALLOWED_WEBHOOK_SCHEMES"),
+                "{raw:?} should be rejected; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_schemes_reject_empty_list() {
+        for raw in [",", "", "  ", " , , "] {
+            let err = parse_webhook_schemes(raw).unwrap_err().to_string();
+            assert!(
+                err.contains("is empty"),
+                "{raw:?} should be rejected; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_accepts_upper_case_https_webhook_scheme() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("ALLOWED_WEBHOOK_SCHEMES", Some("HTTPS")),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.allowed_webhook_schemes, vec!["https"]);
+            },
+        );
+    }
+
+    #[test]
+    fn startup_aborts_on_unsupported_webhook_scheme() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("ALLOWED_WEBHOOK_SCHEMES", Some("ftp")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("ftp"), "got: {err}");
+                assert!(err.contains("ALLOWED_WEBHOOK_SCHEMES"), "got: {err}");
+            },
+        );
+    }
+
+    #[test]
+    fn startup_aborts_on_empty_webhook_scheme_list() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("ALLOWED_WEBHOOK_SCHEMES", Some(",")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("ALLOWED_WEBHOOK_SCHEMES"), "got: {err}");
+            },
+        );
+    }
+
+    #[test]
+    fn webhook_schemes_default_to_https_when_unset() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("ALLOWED_WEBHOOK_SCHEMES", None),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.allowed_webhook_schemes, vec!["https"]);
+            },
         );
     }
 
