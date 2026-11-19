@@ -65,17 +65,33 @@ impl AcceptedAsset {
             .collect()
     }
 
-    pub fn default_list() -> Vec<Self> {
-        vec![
-            AcceptedAsset {
-                code: "XLM".into(),
-                issuer: None,
-            },
-            AcceptedAsset {
+    /// The default allow-list used when `ACCEPTED_ASSETS` is unset, for the
+    /// given `STELLAR_NETWORK` value.
+    ///
+    /// - `testnet` (and any non-`public` network): native XLM plus Circle's
+    ///   testnet USDC issuer.
+    /// - `public`: native XLM only. The testnet USDC issuer holds no real USDC
+    ///   on mainnet, so accepting it by default would price intents in an
+    ///   asset real customers can never pay with (issue #968). Mainnet assets
+    ///   must be opted into explicitly via `ACCEPTED_ASSETS`.
+    pub fn default_list_for_network(network: &str) -> Vec<Self> {
+        let mut assets = vec![AcceptedAsset {
+            code: "XLM".into(),
+            issuer: None,
+        }];
+        if network != "public" {
+            assets.push(AcceptedAsset {
                 code: "USDC".into(),
                 issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
-            },
-        ]
+            });
+        }
+        assets
+    }
+
+    /// The testnet default allow-list. Equivalent to
+    /// `default_list_for_network("testnet")`.
+    pub fn default_list() -> Vec<Self> {
+        Self::default_list_for_network("testnet")
     }
 }
 
@@ -316,20 +332,35 @@ impl Config {
             Self::validate_admin_secret(std::env::var("ADMIN_PROVISIONING_SECRET"))?;
         let metrics_token = Self::validate_metrics_token(std::env::var("METRICS_TOKEN"))?;
 
+        // Computed before `network` is moved into the struct below.
+        let accepted_assets = {
+            let raw = std::env::var("ACCEPTED_ASSETS").unwrap_or_default();
+            if raw.is_empty() {
+                AcceptedAsset::default_list_for_network(&network)
+            } else {
+                AcceptedAsset::parse_list(&raw)
+            }
+        };
+        tracing::info!(
+            network = %network,
+            accepted_assets = %accepted_assets
+                .iter()
+                .map(|a| match &a.issuer {
+                    Some(issuer) => format!("{}:{issuer}", a.code),
+                    None => a.code.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            "effective ACCEPTED_ASSETS allow-list"
+        );
+
         let config = Self {
             port: parse_env("PORT", 3000)?,
             database_url,
             network,
             horizon_url,
             gateway_public,
-            accepted_assets: {
-                let raw = std::env::var("ACCEPTED_ASSETS").unwrap_or_default();
-                if raw.is_empty() {
-                    AcceptedAsset::default_list()
-                } else {
-                    AcceptedAsset::parse_list(&raw)
-                }
-            },
+            accepted_assets,
             webhook_secret,
             allowed_webhook_schemes,
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3)?,
@@ -903,6 +934,61 @@ mod tests {
                 code: "EURC".into(),
                 issuer: Some("GISSUER2".into())
             }
+        );
+    }
+
+    const TESTNET_USDC_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+    #[test]
+    fn default_assets_on_testnet_include_testnet_usdc() {
+        let assets = AcceptedAsset::default_list_for_network("testnet");
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets[0].code, "XLM");
+        assert_eq!(assets[0].issuer, None);
+        assert_eq!(assets[1].code, "USDC");
+        assert_eq!(assets[1].issuer.as_deref(), Some(TESTNET_USDC_ISSUER));
+        assert_eq!(AcceptedAsset::default_list(), assets);
+    }
+
+    #[test]
+    fn default_assets_on_public_are_xlm_only() {
+        // Issue #968: the testnet USDC issuer must never be accepted by default
+        // on mainnet, where it holds no real USDC.
+        let assets = AcceptedAsset::default_list_for_network("public");
+        assert_eq!(
+            assets,
+            vec![AcceptedAsset {
+                code: "XLM".into(),
+                issuer: None
+            }]
+        );
+        assert!(
+            assets
+                .iter()
+                .all(|a| a.issuer.as_deref() != Some(TESTNET_USDC_ISSUER)),
+            "public default must not contain the testnet USDC issuer"
+        );
+    }
+
+    #[test]
+    fn public_network_without_accepted_assets_never_accepts_testnet_issuer() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("public")),
+                ("CORS_ALLOWED_ORIGINS", Some("https://example.com")),
+                ("ACCEPTED_ASSETS", None),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert!(
+                    cfg.accepted_assets
+                        .iter()
+                        .all(|a| a.issuer.as_deref() != Some(TESTNET_USDC_ISSUER)),
+                    "boot on public without ACCEPTED_ASSETS accepted the testnet issuer: {:?}",
+                    cfg.accepted_assets
+                );
+            },
         );
     }
 
