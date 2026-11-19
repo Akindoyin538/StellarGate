@@ -1042,7 +1042,7 @@ mod tests {
         let _guard = LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
-            .unwrap();
+            .expect("env lock should not be poisoned");
 
         // Backup current env values
         let backups: Vec<(String, Option<String>)> = env_vars
@@ -1118,7 +1118,8 @@ mod tests {
                 ("CORS_ALLOWED_ORIGINS", Some("https://example.com")),
             ],
             || {
-                let cfg = Config::from_env().unwrap();
+                let cfg = Config::from_env()
+                    .expect("Config::from_env should succeed with CORS_ALLOWED_ORIGINS set");
                 assert_eq!(cfg.network, "public");
                 assert_eq!(
                     cfg.webhook_secret,
@@ -1363,19 +1364,36 @@ mod tests {
 
     #[test]
     fn listener_mode_empty_defaults_to_stream() {
-        assert_eq!(ListenerMode::parse("").unwrap(), ListenerMode::Stream);
+        assert_eq!(
+            ListenerMode::parse("").expect("ListenerMode::parse should accept an empty value"),
+            ListenerMode::Stream
+        );
     }
 
     #[test]
     fn listener_mode_stream_parses() {
-        assert_eq!(ListenerMode::parse("stream").unwrap(), ListenerMode::Stream);
-        assert_eq!(ListenerMode::parse("STREAM").unwrap(), ListenerMode::Stream);
+        assert_eq!(
+            ListenerMode::parse("stream").expect("ListenerMode::parse should accept stream"),
+            ListenerMode::Stream
+        );
+        assert_eq!(
+            ListenerMode::parse("STREAM")
+                .expect("ListenerMode::parse should accept STREAM case-insensitively"),
+            ListenerMode::Stream
+        );
     }
 
     #[test]
     fn listener_mode_poll_parses() {
-        assert_eq!(ListenerMode::parse("poll").unwrap(), ListenerMode::Poll);
-        assert_eq!(ListenerMode::parse("POLL").unwrap(), ListenerMode::Poll);
+        assert_eq!(
+            ListenerMode::parse("poll").expect("ListenerMode::parse should accept poll"),
+            ListenerMode::Poll
+        );
+        assert_eq!(
+            ListenerMode::parse("POLL")
+                .expect("ListenerMode::parse should accept POLL case-insensitively"),
+            ListenerMode::Poll
+        );
     }
 
     #[test]
@@ -1411,7 +1429,8 @@ mod tests {
                 ("ALLOWED_WEBHOOK_SCHEMES", Some("https,http")),
             ],
             || {
-                Config::from_env().unwrap();
+                Config::from_env()
+                    .expect("Config::from_env should succeed with https,http webhook schemes");
                 assert!(
                     logs_contain("ALLOWED_WEBHOOK_SCHEMES"),
                     "including http in ALLOWED_WEBHOOK_SCHEMES must log a warning, \
@@ -1431,7 +1450,8 @@ mod tests {
                 ("ALLOWED_WEBHOOK_SCHEMES", Some("https")),
             ],
             || {
-                Config::from_env().unwrap();
+                Config::from_env()
+                    .expect("Config::from_env should succeed with the https webhook scheme");
                 assert!(!logs_contain("ALLOWED_WEBHOOK_SCHEMES"));
             },
         );
@@ -1473,7 +1493,9 @@ mod tests {
                 ("WEBHOOK_ALLOW_PRIVATE_TARGETS", Some("true")),
             ],
             || {
-                let cfg = Config::from_env().unwrap();
+                let cfg = Config::from_env().expect(
+                    "Config::from_env should succeed on testnet with private targets allowed",
+                );
                 assert!(
                     cfg.webhook_allow_private_targets,
                     "flag should be set on testnet"
@@ -1493,7 +1515,10 @@ mod tests {
             "absent secret should succeed; got: {:?}",
             result
         );
-        assert_eq!(result.unwrap(), "");
+        assert_eq!(
+            result.expect("validate_admin_secret should accept an absent secret"),
+            ""
+        );
     }
 
     /// An explicitly empty env var is the same as absent.
@@ -1505,7 +1530,10 @@ mod tests {
             "empty string should succeed; got: {:?}",
             result
         );
-        assert_eq!(result.unwrap(), "");
+        assert_eq!(
+            result.expect("validate_admin_secret should accept an empty secret"),
+            ""
+        );
     }
 
     /// A value shorter than 32 characters is rejected.
@@ -1579,7 +1607,10 @@ mod tests {
             "strong secret should be accepted; got: {:?}",
             result
         );
-        assert_eq!(result.unwrap(), strong);
+        assert_eq!(
+            result.expect("validate_admin_secret should accept a strong secret"),
+            strong
+        );
     }
 
     /// The whole from_env path must accept a strong admin secret.
@@ -1594,7 +1625,8 @@ mod tests {
                 ),
             ],
             || {
-                let cfg = Config::from_env().unwrap();
+                let cfg = Config::from_env()
+                    .expect("Config::from_env should succeed with ADMIN_PROVISIONING_SECRET set");
                 assert!(!cfg.admin_provisioning_secret.is_empty());
             },
         );
@@ -1630,7 +1662,10 @@ mod tests {
             "absent token should succeed; got: {:?}",
             result
         );
-        assert_eq!(result.unwrap(), "");
+        assert_eq!(
+            result.expect("validate_metrics_token should accept an absent token"),
+            ""
+        );
     }
 
     /// An explicitly empty env var is the same as absent.
@@ -1642,7 +1677,10 @@ mod tests {
             "empty string should succeed; got: {:?}",
             result
         );
-        assert_eq!(result.unwrap(), "");
+        assert_eq!(
+            result.expect("validate_metrics_token should accept an empty token"),
+            ""
+        );
     }
 
     /// A value shorter than 32 characters is rejected.
@@ -1684,7 +1722,10 @@ mod tests {
             "strong token should be accepted; got: {:?}",
             result
         );
-        assert_eq!(result.unwrap(), strong);
+        assert_eq!(
+            result.expect("validate_metrics_token should accept a strong token"),
+            strong
+        );
     }
 
     /// The whole from_env path must accept a strong metrics token.
@@ -1699,7 +1740,8 @@ mod tests {
                 ),
             ],
             || {
-                let cfg = Config::from_env().unwrap();
+                let cfg = Config::from_env()
+                    .expect("Config::from_env should succeed with METRICS_TOKEN set");
                 assert!(!cfg.metrics_token.is_empty());
             },
         );
@@ -1734,7 +1776,8 @@ mod tests {
                 ("METRICS_TOKEN", None),
             ],
             || {
-                let cfg = Config::from_env().unwrap();
+                let cfg = Config::from_env()
+                    .expect("Config::from_env should succeed with METRICS_TOKEN unset");
                 assert!(
                     cfg.metrics_token.is_empty(),
                     "metrics_token should be empty (disabled) by default"
